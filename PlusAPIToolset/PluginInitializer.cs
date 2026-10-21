@@ -1,7 +1,7 @@
 ﻿using System;
 
 namespace PlusAPIToolset {
-    public class Class1 {
+    public class PluginInitializer {
 
     }
 }
