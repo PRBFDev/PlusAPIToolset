@@ -1,0 +1,596 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using BepInEx;
+using PlusAPIToolset.BsodaToolkit;
+using PlusAPIToolset.Core;
+using UnityEngine;
+
+namespace PlusAPIToolset {
+    public static class SodaBuilder {
+        private static ITM_BSODA? s_originalBsoda;
+        private static ItemObject? s_originalItemObject;
+        private static readonly Dictionary<Type, GameObject> s_registeredPrefabs = new Dictionary<Type, GameObject>();
+        private static readonly Dictionary<Type, ItemObject> s_registeredItems = new Dictionary<Type, ItemObject>();
+        private static readonly List<Type> s_pendingTypes = new List<Type>();
+        private static readonly Dictionary<string, Sprite> s_spriteCache = new Dictionary<string, Sprite>();
+        private static readonly Dictionary<string, SoundObject> s_soundCache = new Dictionary<string, SoundObject>();
+
+        public static IReadOnlyDictionary<Type, GameObject> RegisteredPrefabs {
+            get {
+                return s_registeredPrefabs;
+            }
+        }
+
+        public static IReadOnlyDictionary<Type, ItemObject> RegisteredItems {
+            get {
+                return s_registeredItems;
+            }
+        }
+
+        public static string GetCorePath(string guid) {
+            return Path.Combine(Application.streamingAssetsPath, "Modded", guid, "Assets", "CustomSodas");
+        }
+
+        public static string GetImagesPath(string guid) {
+            return Path.Combine(GetCorePath(guid), "Images");
+        }
+
+        public static string GetSoundsPath(string guid) {
+            return Path.Combine(GetCorePath(guid), "Sounds");
+        }
+
+        public static void EnsureDirectoriesExist(string guid) {
+            try {
+                string imagesPath = GetImagesPath(guid);
+                string soundsPath = GetSoundsPath(guid);
+
+                if (!Directory.Exists(imagesPath)) {
+                    Directory.CreateDirectory(imagesPath);
+                }
+                if (!Directory.Exists(soundsPath)) {
+                    Directory.CreateDirectory(soundsPath);
+                }
+            } catch (Exception ex) {
+                Debug.LogError($"[PlusAPIToolset] Failed to create asset directories for GUID '{guid}': {ex.Message}");
+            }
+        }
+
+        public static ITM_BSODA? GetOriginalBsoda() {
+            if (s_originalBsoda != null) {
+                return s_originalBsoda;
+            }
+
+            ItemObject[] items = Resources.FindObjectsOfTypeAll<ItemObject>();
+            for (int i = 0; i < items.Length; i++) {
+                ItemObject current = items[i];
+                if (current != null && current.itemType == Items.Bsoda && current.item is ITM_BSODA bsoda) {
+                    s_originalBsoda = bsoda;
+                    s_originalItemObject = current;
+                    return s_originalBsoda;
+                }
+            }
+
+            ITM_BSODA[] bsodas = Resources.FindObjectsOfTypeAll<ITM_BSODA>();
+            for (int i = 0; i < bsodas.Length; i++) {
+                if (bsodas[i] != null) {
+                    s_originalBsoda = bsodas[i];
+                    return s_originalBsoda;
+                }
+            }
+
+            return null;
+        }
+
+        public static ItemObject? GetOriginalItemObject() {
+            if (s_originalItemObject != null) {
+                return s_originalItemObject;
+            }
+
+            ItemObject[] items = Resources.FindObjectsOfTypeAll<ItemObject>();
+            for (int i = 0; i < items.Length; i++) {
+                ItemObject current = items[i];
+                if (current != null && current.itemType == Items.Bsoda) {
+                    s_originalItemObject = current;
+                    return s_originalItemObject;
+                }
+            }
+
+            return null;
+        }
+
+        public static GameObject? CreateSodaPrefab(Type sodaType, string prefabName, out SodaObject? sodaComponent) {
+            if (!typeof(SodaObject).IsAssignableFrom(sodaType) || sodaType.IsAbstract) {
+                sodaComponent = null;
+                return null;
+            }
+
+            ITM_BSODA? original = GetOriginalBsoda();
+            if (original == null) {
+                sodaComponent = null;
+                return null;
+            }
+
+            GameObject prefab = PrefabBuilder.Clone(original.gameObject, prefabName);
+            ITM_BSODA oldComp = prefab.GetComponent<ITM_BSODA>();
+            SodaObject newComp = (SodaObject)prefab.AddComponent(sodaType);
+
+            CopyBsodaProperties(original, newComp);
+
+            if (oldComp != null) {
+                UnityEngine.Object.DestroyImmediate(oldComp);
+            }
+
+            EnsureDirectoriesExist(newComp.ModGuid);
+
+            List<string> missingAssets = new List<string>();
+            if (newComp.Spray == null) {
+                missingAssets.Add("Spray");
+            }
+            if (newComp.Soda_Small == null) {
+                missingAssets.Add("Soda_Small");
+            }
+            if (newComp.Soda_Large == null) {
+                missingAssets.Add("Soda_Large");
+            }
+            if (newComp.CustomSound == null) {
+                missingAssets.Add("CustomSound");
+            }
+
+            if (missingAssets.Count > 0) {
+                Debug.LogError($"[PlusAPIToolset] Cannot register '{sodaType.Name}' as custom BSODA. Missing required assets: {string.Join(", ", missingAssets)}. Expected location: '{GetCorePath(newComp.ModGuid)}'.");
+                UnityEngine.Object.DestroyImmediate(prefab);
+                sodaComponent = null;
+                return null;
+            }
+
+            newComp.SetSprite(newComp.Spray!);
+            newComp.Sound = newComp.CustomSound;
+
+            ItemObject? itemObj = CreateItemObject(newComp);
+            if (itemObj != null) {
+                s_registeredItems[sodaType] = itemObj;
+
+                if (newComp.AddToLevelGeneration || newComp.AddToShopGeneration) {
+                    AddItemToLevelGeneration(itemObj, newComp.TargetFloors, newComp.SpawnWeight, newComp.AddToLevelGeneration, newComp.AddToShopGeneration);
+                }
+            }
+
+            sodaComponent = newComp;
+            return prefab;
+        }
+
+        public static GameObject? CreateSodaPrefab<T>(string prefabName, out T? sodaComponent) where T : SodaObject {
+            GameObject? prefab = CreateSodaPrefab(typeof(T), prefabName, out SodaObject? comp);
+            sodaComponent = comp as T;
+            return prefab;
+        }
+
+        public static ItemObject? CreateItemObject(SodaObject soda) {
+            ItemObject? original = GetOriginalItemObject();
+            if (original == null) {
+                return null;
+            }
+
+            ItemObject itemObj = UnityEngine.Object.Instantiate(original);
+            itemObj.name = "Item_" + soda.gameObject.name;
+            itemObj.item = soda;
+            itemObj.itemType = soda.ItemType;
+            itemObj.hideFlags = HideFlags.HideAndDontSave;
+
+            if (soda.Soda_Small != null) {
+                itemObj.itemSpriteSmall = soda.Soda_Small;
+            }
+            if (soda.Soda_Large != null) {
+                itemObj.itemSpriteLarge = soda.Soda_Large;
+            }
+            if (!string.IsNullOrEmpty(soda.ItemNameKey)) {
+                itemObj.nameKey = soda.ItemNameKey;
+            }
+            if (!string.IsNullOrEmpty(soda.ItemDescKey)) {
+                itemObj.descKey = soda.ItemDescKey;
+            }
+
+            itemObj.price = soda.ItemPrice;
+            itemObj.value = soda.ItemValue;
+
+            soda.AssociatedItem = itemObj;
+            return itemObj;
+        }
+
+        public static BsodaFloor GetFloorFromLevelName(string? name) {
+            if (string.IsNullOrEmpty(name)) {
+                return BsodaFloor.None;
+            }
+
+            string upper = name.ToUpperInvariant();
+            if (upper.Contains("ENDLESS") || upper.Contains("_END") || upper.Contains("END_") || upper.StartsWith("END")) {
+                return BsodaFloor.END;
+            }
+            if (upper.Contains("F1") || upper.Contains("LEVEL1") || upper.Contains("FLOOR1")) {
+                return BsodaFloor.F1;
+            }
+            if (upper.Contains("F2") || upper.Contains("LEVEL2") || upper.Contains("FLOOR2")) {
+                return BsodaFloor.F2;
+            }
+            if (upper.Contains("F3") || upper.Contains("LEVEL3") || upper.Contains("FLOOR3")) {
+                return BsodaFloor.F3;
+            }
+            if (upper.Contains("F4") || upper.Contains("LEVEL4") || upper.Contains("FLOOR4")) {
+                return BsodaFloor.F4;
+            }
+            if (upper.Contains("F5") || upper.Contains("LEVEL5") || upper.Contains("FLOOR5")) {
+                return BsodaFloor.F5;
+            }
+            return BsodaFloor.None;
+        }
+
+        public static BsodaFloor GetFloorFromScene(SceneObject scene) {
+            if (scene == null) {
+                return BsodaFloor.None;
+            }
+
+            switch (scene.levelNo) {
+                case 1:
+                    return BsodaFloor.F1;
+                case 2:
+                    return BsodaFloor.F2;
+                case 3:
+                    return BsodaFloor.F3;
+                case 4:
+                    return BsodaFloor.F4;
+                case 5:
+                    return BsodaFloor.F5;
+            }
+
+            if (!string.IsNullOrEmpty(scene.levelTitle)) {
+                BsodaFloor titleFloor = GetFloorFromLevelName(scene.levelTitle);
+                if (titleFloor != BsodaFloor.None) {
+                    return titleFloor;
+                }
+            }
+
+            return GetFloorFromLevelName(scene.name);
+        }
+
+        public static void AddItemToLevelGeneration(ItemObject item, BsodaFloor targetFloors = BsodaFloor.All, int weight = 50, bool addToHallways = true, bool addToShop = true) {
+            WeightedItemObject weightedItem = new WeightedItemObject {
+                selection = item,
+                weight = weight
+            };
+
+            LevelObject[] levels = Resources.FindObjectsOfTypeAll<LevelObject>();
+            for (int i = 0; i < levels.Length; i++) {
+                LevelObject level = levels[i];
+                if (level == null) {
+                    continue;
+                }
+
+                BsodaFloor floor = GetFloorFromLevelName(level.name);
+                bool matchesFloor = floor == BsodaFloor.None || (floor & targetFloors) != 0;
+
+                if (addToHallways && matchesFloor) {
+                    if (level.items != null) {
+                        level.items = AppendToArray(level.items, weightedItem);
+                    }
+                    if (level.potentialItems != null) {
+                        level.potentialItems = AppendToArray(level.potentialItems, weightedItem);
+                    }
+                }
+
+                if (addToShop && (targetFloors & BsodaFloor.PIT) != 0 && level.shopItems != null) {
+                    level.shopItems = AppendToArray(level.shopItems, weightedItem);
+                }
+            }
+
+            if (addToShop && (targetFloors & BsodaFloor.PIT) != 0) {
+                SceneObject[] scenes = Resources.FindObjectsOfTypeAll<SceneObject>();
+                for (int i = 0; i < scenes.Length; i++) {
+                    SceneObject scene = scenes[i];
+                    if (scene != null && scene.shopItems != null) {
+                        scene.shopItems = AppendToArray(scene.shopItems, weightedItem);
+                    }
+                }
+            }
+        }
+
+        public static void ProcessPendingRegistrations() {
+            if (GetOriginalBsoda() == null) {
+                return;
+            }
+
+            for (int i = s_pendingTypes.Count - 1; i >= 0; i--) {
+                Type type = s_pendingTypes[i];
+                if (s_registeredPrefabs.ContainsKey(type)) {
+                    s_pendingTypes.RemoveAt(i);
+                    continue;
+                }
+
+                SodaAttribute? attr = type.GetCustomAttribute<SodaAttribute>();
+                string prefabName = attr != null ? attr.Name : type.Name;
+
+                GameObject? prefab = CreateSodaPrefab(type, prefabName, out _);
+                if (prefab != null) {
+                    s_registeredPrefabs[type] = prefab;
+                }
+                s_pendingTypes.RemoveAt(i);
+            }
+        }
+
+        public static void ApplyGenerationToLoadedScenes() {
+            ProcessPendingRegistrations();
+
+            foreach (KeyValuePair<Type, ItemObject> pair in s_registeredItems) {
+                GameObject? prefab = GetPrefab(pair.Key);
+                if (prefab == null) {
+                    continue;
+                }
+
+                SodaObject soda = prefab.GetComponent<SodaObject>();
+                if (soda != null && (soda.AddToLevelGeneration || soda.AddToShopGeneration)) {
+                    AddItemToLevelGeneration(pair.Value, soda.TargetFloors, soda.SpawnWeight, soda.AddToLevelGeneration, soda.AddToShopGeneration);
+                }
+            }
+        }
+
+        private static WeightedItemObject[] AppendToArray(WeightedItemObject[] original, WeightedItemObject newItem) {
+            for (int i = 0; i < original.Length; i++) {
+                if (original[i] != null && original[i].selection == newItem.selection) {
+                    return original;
+                }
+            }
+
+            WeightedItemObject[] updated = new WeightedItemObject[original.Length + 1];
+            Array.Copy(original, updated, original.Length);
+            updated[original.Length] = newItem;
+            return updated;
+        }
+
+        public static void AutoRegisterAll(Assembly? assembly = null) {
+            Assembly targetAssembly = assembly ?? Assembly.GetCallingAssembly();
+            Type[] types = targetAssembly.GetTypes();
+
+            for (int i = 0; i < types.Length; i++) {
+                Type type = types[i];
+                if (type.IsAbstract || !typeof(SodaObject).IsAssignableFrom(type)) {
+                    continue;
+                }
+
+                BepInPlugin? pluginAttr = type.Assembly.GetCustomAttribute<BepInPlugin>();
+                string guid = pluginAttr != null ? pluginAttr.GUID : PlusModInfo.GUID;
+                EnsureDirectoriesExist(guid);
+
+                if (!s_pendingTypes.Contains(type)) {
+                    s_pendingTypes.Add(type);
+                }
+            }
+
+            ProcessPendingRegistrations();
+        }
+
+        public static GameObject? GetPrefab<T>() where T : SodaObject {
+            return GetPrefab(typeof(T));
+        }
+
+        public static GameObject? GetPrefab(Type type) {
+            if (s_registeredPrefabs.TryGetValue(type, out GameObject? prefab)) {
+                return prefab;
+            }
+            return null;
+        }
+
+        public static ItemObject? GetItem<T>() where T : SodaObject {
+            return GetItem(typeof(T));
+        }
+
+        public static ItemObject? GetItem(Type type) {
+            if (s_registeredItems.TryGetValue(type, out ItemObject? item)) {
+                return item;
+            }
+            return null;
+        }
+
+        public static T? Spawn<T>(Vector3 position = default, Quaternion rotation = default, Transform? parent = null) where T : SodaObject {
+            GameObject? prefab = GetPrefab<T>();
+            if (prefab == null) {
+                return null;
+            }
+            return PrefabBuilder.Spawn<T>(prefab, position, rotation, parent);
+        }
+
+        public static void CopyBsodaProperties(ITM_BSODA source, SodaObject destination) {
+            destination.SpriteRenderer = destination.GetComponentInChildren<SpriteRenderer>();
+            destination.Entity = destination.GetComponent<Entity>();
+
+            Type sourceType = typeof(ITM_BSODA);
+            FieldInfo? moveModField = sourceType.GetField("moveMod", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (moveModField != null && moveModField.GetValue(source) is MovementModifier origMod) {
+                destination.MovementModifier = new MovementModifier(origMod.movementAddend, origMod.movementMultiplier, origMod.priority);
+            } else {
+                destination.MovementModifier = new MovementModifier(Vector3.zero, 1f, 1);
+            }
+
+            FieldInfo? soundField = sourceType.GetField("sound", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            FieldInfo? speedField = sourceType.GetField("speed", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            FieldInfo? timeField = sourceType.GetField("time", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            if (soundField != null) {
+                destination.Sound = soundField.GetValue(source) as SoundObject;
+            }
+            if (speedField != null) {
+                destination.Speed = (float)speedField.GetValue(source);
+            }
+            if (timeField != null) {
+                destination.TimeRemaining = (float)timeField.GetValue(source);
+            }
+        }
+
+        public static Sprite? TryResolveSprite(Type type, string suffix, string guid, float pixelsPerUnit = 25f) {
+            string cacheKey = $"{type.FullName}_{suffix}";
+            if (s_spriteCache.TryGetValue(cacheKey, out Sprite cached)) {
+                return cached;
+            }
+
+            string targetFileName = $"{type.Name}_{suffix}.png";
+
+            string imagesDir = GetImagesPath(guid);
+            string primaryPath = Path.Combine(imagesDir, targetFileName);
+            if (File.Exists(primaryPath)) {
+                Sprite? sprite = CreateSpriteFromFile(primaryPath, pixelsPerUnit);
+                if (sprite != null) {
+                    s_spriteCache[cacheKey] = sprite;
+                    return sprite;
+                }
+            }
+
+            Assembly assembly = type.Assembly;
+            string[] resourceNames = assembly.GetManifestResourceNames();
+            for (int i = 0; i < resourceNames.Length; i++) {
+                if (resourceNames[i].EndsWith(targetFileName, StringComparison.OrdinalIgnoreCase)) {
+                    using (Stream? stream = assembly.GetManifestResourceStream(resourceNames[i])) {
+                        if (stream != null) {
+                            byte[] data = new byte[stream.Length];
+                            stream.Read(data, 0, data.Length);
+                            Sprite sprite = CreateSpriteFromBytes(data, pixelsPerUnit);
+                            s_spriteCache[cacheKey] = sprite;
+                            return sprite;
+                        }
+                    }
+                }
+            }
+
+            string? assemblyLocation = assembly.Location;
+            if (!string.IsNullOrEmpty(assemblyLocation)) {
+                string? assemblyDir = Path.GetDirectoryName(assemblyLocation);
+                if (!string.IsNullOrEmpty(assemblyDir)) {
+                    string[] searchPaths = new string[] {
+                        Path.Combine(assemblyDir, targetFileName),
+                        Path.Combine(assemblyDir, "Textures", targetFileName),
+                        Path.Combine(assemblyDir, "Assets", targetFileName),
+                        Path.Combine(assemblyDir, "Sprites", targetFileName),
+                        Path.Combine(assemblyDir, "Resources", targetFileName)
+                    };
+
+                    for (int i = 0; i < searchPaths.Length; i++) {
+                        if (File.Exists(searchPaths[i])) {
+                            Sprite? sprite = CreateSpriteFromFile(searchPaths[i], pixelsPerUnit);
+                            if (sprite != null) {
+                                s_spriteCache[cacheKey] = sprite;
+                                return sprite;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        public static SoundObject? TryResolveSound(Type type, string guid) {
+            string cacheKey = $"{type.FullName}_Sound";
+            if (s_soundCache.TryGetValue(cacheKey, out SoundObject cached)) {
+                return cached;
+            }
+
+            string soundsDir = GetSoundsPath(guid);
+            string[] candidateFiles = new string[] {
+                $"{type.Name}.wav",
+                $"{type.Name}_Sound.wav"
+            };
+
+            for (int i = 0; i < candidateFiles.Length; i++) {
+                string soundPath = Path.Combine(soundsDir, candidateFiles[i]);
+                if (File.Exists(soundPath)) {
+                    AudioClip? clip = LoadWav(soundPath);
+                    if (clip != null) {
+                        SoundObject soundObj = CreateSoundObject(clip, type.Name, SoundType.Effect);
+                        s_soundCache[cacheKey] = soundObj;
+                        return soundObj;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        public static SoundObject CreateSoundObject(AudioClip clip, string soundKey = "", SoundType type = SoundType.Effect, Color color = default) {
+            SoundObject sound = ScriptableObject.CreateInstance<SoundObject>();
+            sound.soundClip = clip;
+            sound.soundType = type;
+            sound.soundKey = soundKey;
+            sound.color = color == default ? Color.white : color;
+            sound.volumeMultiplier = 1f;
+            sound.hideFlags = HideFlags.HideAndDontSave;
+            return sound;
+        }
+
+        public static AudioClip? LoadWav(string filePath) {
+            if (!File.Exists(filePath)) {
+                return null;
+            }
+
+            byte[] fileBytes = File.ReadAllBytes(filePath);
+            if (fileBytes.Length < 44) {
+                return null;
+            }
+
+            int channels = BitConverter.ToInt16(fileBytes, 22);
+            int sampleRate = BitConverter.ToInt32(fileBytes, 24);
+            int bitsPerSample = BitConverter.ToInt16(fileBytes, 34);
+
+            int pos = 12;
+            while (pos < fileBytes.Length - 8) {
+                string chunkId = System.Text.Encoding.ASCII.GetString(fileBytes, pos, 4);
+                int chunkSize = BitConverter.ToInt32(fileBytes, pos + 4);
+                pos += 8;
+
+                if (chunkId == "data") {
+                    int bytesPerSample = bitsPerSample / 8;
+                    int totalSamples = chunkSize / bytesPerSample;
+                    float[] audioData = new float[totalSamples];
+
+                    if (bitsPerSample == 16) {
+                        for (int i = 0; i < totalSamples; i++) {
+                            short sample = BitConverter.ToInt16(fileBytes, pos + i * 2);
+                            audioData[i] = sample / 32768f;
+                        }
+                    } else if (bitsPerSample == 8) {
+                        for (int i = 0; i < totalSamples; i++) {
+                            byte sample = fileBytes[pos + i];
+                            audioData[i] = (sample - 128) / 128f;
+                        }
+                    }
+
+                    AudioClip clip = AudioClip.Create(Path.GetFileNameWithoutExtension(filePath), totalSamples / channels, channels, sampleRate, false);
+                    clip.SetData(audioData, 0);
+                    return clip;
+                }
+
+                pos += chunkSize;
+            }
+
+            return null;
+        }
+
+        public static Sprite CreateSprite(Texture2D texture, float pixelsPerUnit = 1f) {
+            return Sprite.Create(texture, new Rect(0f, 0f, texture.width, texture.height), new Vector2(0.5f, 0.5f), pixelsPerUnit);
+        }
+
+        public static Sprite CreateSpriteFromBytes(byte[] data, float pixelsPerUnit = 25f) {
+            Texture2D texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+            texture.LoadImage(data);
+            texture.filterMode = FilterMode.Point;
+            return CreateSprite(texture, pixelsPerUnit);
+        }
+
+        public static Sprite? CreateSpriteFromFile(string filePath, float pixelsPerUnit = 25f) {
+            if (!File.Exists(filePath)) {
+                return null;
+            }
+
+            byte[] data = File.ReadAllBytes(filePath);
+            return CreateSpriteFromBytes(data, pixelsPerUnit);
+        }
+    }
+}

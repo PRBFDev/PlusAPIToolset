@@ -1,0 +1,261 @@
+using System.Collections.Generic;
+using System.Reflection;
+using BepInEx;
+using PlusAPIToolset.BsodaToolkit;
+using PlusAPIToolset.Core;
+using UnityEngine;
+
+namespace PlusAPIToolset {
+    public abstract class SodaObject : Item, IEntityTrigger {
+        protected EnvironmentController? ec;
+
+        [SerializeField]
+        protected Entity? entity;
+
+        [SerializeField]
+        protected MovementModifier? moveMod;
+
+        [SerializeField]
+        protected SpriteRenderer? spriteRenderer;
+
+        [SerializeField]
+        protected SoundObject? sound;
+
+        [SerializeField]
+        protected float speed = 55f;
+
+        [SerializeField]
+        protected float time = 5f;
+
+        protected bool launching = true;
+
+        protected List<ActivityModifier> activityMods = new List<ActivityModifier>();
+
+        public virtual string ModGuid {
+            get {
+                BepInPlugin? pluginAttr = GetType().Assembly.GetCustomAttribute<BepInPlugin>();
+                return pluginAttr != null ? pluginAttr.GUID : PlusModInfo.GUID;
+            }
+        }
+
+        public virtual Sprite? Spray => SodaBuilder.TryResolveSprite(GetType(), "Spray", ModGuid);
+
+        public virtual Sprite? Soda_Small => SodaBuilder.TryResolveSprite(GetType(), "Small", ModGuid);
+
+        public virtual Sprite? Soda_Large => SodaBuilder.TryResolveSprite(GetType(), "Large", ModGuid);
+
+        public virtual SoundObject? CustomSound => SodaBuilder.TryResolveSound(GetType(), ModGuid);
+
+        public virtual string ItemNameKey => $"Itm_{GetType().Name}";
+
+        public virtual string ItemDescKey => $"Desc_{GetType().Name}";
+
+        public virtual int ItemPrice => 100;
+
+        public virtual int ItemValue => 100;
+
+        public virtual Items ItemType => ItemEnumExtensions.Register(GetType().Name);
+
+        public virtual BsodaFloor TargetFloors => BsodaFloor.All;
+
+        public virtual bool AddToLevelGeneration => true;
+
+        public virtual int SpawnWeight => 50;
+
+        public virtual bool AddToShopGeneration => true;
+
+        public virtual int ShopWeight => 50;
+
+        public ItemObject? AssociatedItem { get; internal set; }
+
+        public EnvironmentController? EnvironmentController {
+            get {
+                return ec;
+            }
+            set {
+                ec = value;
+            }
+        }
+
+        public Entity? Entity {
+            get {
+                return entity;
+            }
+            set {
+                entity = value;
+            }
+        }
+
+        public MovementModifier? MovementModifier {
+            get {
+                return moveMod;
+            }
+            set {
+                moveMod = value;
+            }
+        }
+
+        public SpriteRenderer? SpriteRenderer {
+            get {
+                return spriteRenderer;
+            }
+            set {
+                spriteRenderer = value;
+            }
+        }
+
+        public SoundObject? Sound {
+            get {
+                return sound;
+            }
+            set {
+                sound = value;
+            }
+        }
+
+        public float Speed {
+            get {
+                return speed;
+            }
+            set {
+                speed = value;
+            }
+        }
+
+        public float TimeRemaining {
+            get {
+                return time;
+            }
+            set {
+                time = value;
+            }
+        }
+
+        public bool Launching {
+            get {
+                return launching;
+            }
+            set {
+                launching = value;
+            }
+        }
+
+        public List<ActivityModifier> ActivityModifiers {
+            get {
+                return activityMods;
+            }
+        }
+
+        public void SetSprite(Sprite newSprite) {
+            if (spriteRenderer != null) {
+                spriteRenderer.sprite = newSprite;
+            }
+        }
+
+        public override bool Use(PlayerManager pm) {
+            this.pm = pm;
+            ec = pm.ec;
+            transform.position = pm.transform.position;
+            transform.forward = Singleton<CoreGameManager>.Instance.GetCamera(pm.playerNumber).transform.forward;
+
+            if (entity != null) {
+                entity.Initialize(ec, transform.position);
+                entity.CopyStatusEffects(pm.plm.Entity);
+            }
+
+            if (spriteRenderer != null) {
+                if (Spray != null) {
+                    spriteRenderer.sprite = Spray;
+                }
+                spriteRenderer.SetSpriteRotation(Random.Range(0f, 360f));
+            }
+
+            if (CustomSound != null) {
+                sound = CustomSound;
+            }
+
+            if (sound != null) {
+                Singleton<CoreGameManager>.Instance.audMan.PlaySingle(sound);
+            }
+
+            pm.RuleBreak("Drinking", 0.8f, 0.25f);
+
+            if (moveMod != null) {
+                moveMod.priority = 1;
+            }
+
+            OnUsed(pm);
+            return true;
+        }
+
+        protected virtual void OnUsed(PlayerManager pm) {
+        }
+
+        protected virtual void Update() {
+            if (ec == null) {
+                return;
+            }
+
+            float scaledDelta = Time.deltaTime * ec.EnvironmentTimeScale;
+            Vector3 movement = transform.forward * speed * ec.EnvironmentTimeScale;
+
+            if (moveMod != null && entity != null) {
+                moveMod.movementAddend = entity.ExternalActivity.Addend + movement;
+            }
+
+            if (entity != null) {
+                entity.UpdateInternalMovement(movement);
+            }
+
+            time -= scaledDelta;
+            if (time <= 0f) {
+                OnTimeExpired();
+            }
+        }
+
+        protected virtual void OnTimeExpired() {
+            if (moveMod != null) {
+                for (int i = 0; i < activityMods.Count; i++) {
+                    activityMods[i].moveMods.Remove(moveMod);
+                }
+            }
+
+            Destroy(gameObject);
+        }
+
+        public virtual void EntityTriggerEnter(Entity otherEntity, Collider other, bool validCollision) {
+            if (validCollision && (!other.CompareTag("Player") || !launching) && otherEntity != null) {
+                if (moveMod != null) {
+                    otherEntity.ExternalActivity.moveMods.Add(moveMod);
+                }
+                activityMods.Add(otherEntity.ExternalActivity);
+                OnEntityPushed(otherEntity, other);
+            }
+        }
+
+        public virtual void EntityTriggerStay(Entity otherEntity, Collider other, bool validCollision) {
+        }
+
+        public virtual void EntityTriggerExit(Entity otherEntity, Collider other, bool validCollision) {
+            if (validCollision) {
+                if (other.CompareTag("Player")) {
+                    launching = false;
+                }
+
+                if (otherEntity != null) {
+                    if (moveMod != null) {
+                        otherEntity.ExternalActivity.moveMods.Remove(moveMod);
+                    }
+                    activityMods.Remove(otherEntity.ExternalActivity);
+                    OnEntityReleased(otherEntity, other);
+                }
+            }
+        }
+
+        protected virtual void OnEntityPushed(Entity otherEntity, Collider other) {
+        }
+
+        protected virtual void OnEntityReleased(Entity otherEntity, Collider other) {
+        }
+    }
+}

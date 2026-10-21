@@ -3,7 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 
-namespace PlusAPIToolset {
+namespace PlusAPIToolset.Core {
     public static class HarmonyBuilder {
      public static Harmony Prepatch(string GUID) {
             Harmony harmony = new Harmony(GUID);
