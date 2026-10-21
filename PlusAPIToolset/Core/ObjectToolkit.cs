@@ -14,7 +14,11 @@ namespace PlusAPIToolset.Core {
 
         public static T? TryGetInstance<T>() where T : MonoBehaviour {
             if (m_instances.TryGetValue(typeof(T), out object instance)) {
-                return (T)instance;
+                T cached = (T)instance;
+                if (cached != null) {
+                    return cached;
+                }
+                m_instances.Remove(typeof(T));
             }
 
             T found = UnityEngine.Object.FindObjectOfType<T>();

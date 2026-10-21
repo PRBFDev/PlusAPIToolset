@@ -28,7 +28,8 @@ namespace PlusAPIToolset.Core {
                         return item;
                     }
                 }
-            } catch {
+            } catch (Exception ex) {
+                UnityEngine.Debug.LogWarning($"[PlusAPIToolset] MTM101 enum registration failed for '{name}': {ex}");
             }
 
             Items newItem = (Items)s_currentId++;

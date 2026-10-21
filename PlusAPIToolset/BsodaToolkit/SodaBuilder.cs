@@ -95,7 +95,8 @@ namespace PlusAPIToolset {
                         Debug.Log("[PlusAPIToolset] Hooked into MTM101 GeneratorManagement pipeline.");
                     }
                 }
-            } catch {
+            } catch (Exception ex) {
+                Debug.LogWarning($"[PlusAPIToolset] Failed to register with MTM101 GeneratorManagement: {ex}");
             }
         }
 
@@ -124,7 +125,8 @@ namespace PlusAPIToolset {
                         }
                     }
                 }
-            } catch {
+            } catch (Exception ex) {
+                Debug.LogWarning($"[PlusAPIToolset] Failed to resolve the original BSODA through MTM101: {ex}");
             }
 
             ItemObject[] items = Resources.FindObjectsOfTypeAll<ItemObject>();
@@ -276,7 +278,8 @@ namespace PlusAPIToolset {
                 if (pfm != null && pfm.itemObjects != null && !pfm.itemObjects.Contains(itemObj)) {
                     pfm.itemObjects.Add(itemObj);
                 }
-            } catch {
+            } catch (Exception ex) {
+                Debug.LogWarning($"[PlusAPIToolset] Failed to register the item with PlayerFileManager: {ex}");
             }
 
             TryRegisterItemMeta(itemObj, soda);
@@ -307,7 +310,8 @@ namespace PlusAPIToolset {
                         }
                     }
                 }
-            } catch {
+            } catch (Exception ex) {
+                Debug.LogWarning($"[PlusAPIToolset] Failed to register MTM101 item metadata: {ex}");
             }
         }
 
@@ -512,7 +516,8 @@ namespace PlusAPIToolset {
                     if (extType != null) {
                         s_getCustomLevelObjectsMethod = extType.GetMethod("GetCustomLevelObjects", new Type[] { typeof(SceneObject) });
                     }
-                } catch {
+                } catch (Exception ex) {
+                    Debug.LogWarning($"[PlusAPIToolset] Failed to find MTM101 custom level integration: {ex}");
                 }
             }
 
@@ -528,7 +533,8 @@ namespace PlusAPIToolset {
                             }
                         }
                     }
-                } catch {
+                } catch (Exception ex) {
+                    Debug.LogWarning($"[PlusAPIToolset] Failed to inject into MTM101 custom levels: {ex}");
                 }
             }
         }
@@ -676,7 +682,7 @@ namespace PlusAPIToolset {
         }
 
         public static void CopyBsodaProperties(ITM_BSODA source, SodaObject destination) {
-            destination.SpriteRenderer = destination.GetComponentInChildren<SpriteRenderer>();
+            destination.SpriteRenderer = destination.GetComponentInChildren<SpriteRenderer>(true);
             destination.Entity = destination.GetComponent<Entity>();
 
             Type sourceType = typeof(ITM_BSODA);
@@ -703,7 +709,7 @@ namespace PlusAPIToolset {
         }
 
         public static Sprite? TryResolveSprite(Type type, string suffix, string guid, float pixelsPerUnit = 25f) {
-            string cacheKey = $"{type.FullName}_{suffix}";
+            string cacheKey = $"{guid}|{type.AssemblyQualifiedName}|{suffix}|{pixelsPerUnit.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
             if (s_spriteCache.TryGetValue(cacheKey, out Sprite cached)) {
                 return cached;
             }
@@ -726,9 +732,9 @@ namespace PlusAPIToolset {
                 if (resourceNames[i].EndsWith(targetFileName, StringComparison.OrdinalIgnoreCase)) {
                     using (Stream? stream = assembly.GetManifestResourceStream(resourceNames[i])) {
                         if (stream != null) {
-                            byte[] data = new byte[stream.Length];
-                            stream.Read(data, 0, data.Length);
-                            Sprite sprite = CreateSpriteFromBytes(data, pixelsPerUnit);
+                            using MemoryStream buffer = new MemoryStream();
+                            stream.CopyTo(buffer);
+                            Sprite sprite = CreateSpriteFromBytes(buffer.ToArray(), pixelsPerUnit);
                             s_spriteCache[cacheKey] = sprite;
                             return sprite;
                         }
@@ -764,7 +770,7 @@ namespace PlusAPIToolset {
         }
 
         public static SoundObject? TryResolveSound(Type type, string guid) {
-            string cacheKey = $"{type.FullName}_Sound";
+            string cacheKey = $"{guid}|{type.AssemblyQualifiedName}|Sound";
             if (s_soundCache.TryGetValue(cacheKey, out SoundObject cached)) {
                 return cached;
             }
@@ -830,7 +836,8 @@ namespace PlusAPIToolset {
                     if (clip != null && clip.loadState != AudioDataLoadState.Failed && clip.samples > 0 && clip.length > 0f) {
                         return clip;
                     }
-                } catch {
+                } catch (Exception ex) {
+                    Debug.LogWarning($"[PlusAPIToolset] Failed to load audio through MTM101: {ex}");
                 }
             }
 
@@ -867,7 +874,8 @@ namespace PlusAPIToolset {
                         }
                     }
                 }
-            } catch {
+            } catch (Exception ex) {
+                Debug.LogWarning($"[PlusAPIToolset] Failed to load audio through UnityWebRequest: {ex}");
             }
 
             return LoadPcmWav(filePath);
@@ -972,7 +980,8 @@ namespace PlusAPIToolset {
                 AudioClip clip = AudioClip.Create(Path.GetFileNameWithoutExtension(filePath), sampleCountPerChannel, channels, sampleRate, false);
                 clip.SetData(audioData, 0);
                 return clip;
-            } catch {
+            } catch (Exception ex) {
+                Debug.LogWarning($"[PlusAPIToolset] Failed to decode PCM WAV '{filePath}': {ex}");
                 return null;
             }
         }

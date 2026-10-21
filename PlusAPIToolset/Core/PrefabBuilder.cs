@@ -1,4 +1,3 @@
-using System;
 using UnityEngine;
 
 namespace PlusAPIToolset.Core {
@@ -40,7 +39,8 @@ namespace PlusAPIToolset.Core {
                 return null;
             }
 
-            GameObject instance = UnityEngine.Object.Instantiate(template, position, rotation, parent);
+            Quaternion spawnRotation = rotation.Equals(default(Quaternion)) ? Quaternion.identity : rotation;
+            GameObject instance = UnityEngine.Object.Instantiate(template, position, spawnRotation, parent);
             instance.hideFlags = HideFlags.None;
             instance.SetActive(true);
             return instance;

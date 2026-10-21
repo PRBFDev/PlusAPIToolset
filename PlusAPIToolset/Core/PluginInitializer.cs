@@ -1,6 +1,4 @@
-using System;
 using BepInEx;
-using UnityEngine;
 
 namespace PlusAPIToolset.Core {
     [BepInPlugin(PlusModInfo.GUID, PlusModInfo.Name, PlusModInfo.Version)]
