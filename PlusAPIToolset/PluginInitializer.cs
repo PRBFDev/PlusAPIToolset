@@ -1,7 +1,13 @@
-﻿using System;
+﻿using BepInEx;
+using System;
 
 namespace PlusAPIToolset {
-    public class PluginInitializer {
 
+    [BepInPlugin(PlusModInfo.GUID,PlusModInfo.Name,PlusModInfo.Version)]
+    public class PluginInitializer  : BaseUnityPlugin
+    {
+        private void Awake() {
+            HarmonyBuilder.Prepatch(PlusModInfo.GUID);
+        }
     }
 }
