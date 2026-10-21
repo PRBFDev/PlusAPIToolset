@@ -17,6 +17,11 @@ namespace PlusAPIToolset {
         private static readonly List<Type> s_pendingTypes = new List<Type>();
         private static readonly Dictionary<string, Sprite> s_spriteCache = new Dictionary<string, Sprite>();
         private static readonly Dictionary<string, SoundObject> s_soundCache = new Dictionary<string, SoundObject>();
+        private static MethodInfo? s_assetLoaderAudioClipFromFile;
+        private static bool s_assetLoaderChecked;
+        private static MethodInfo? s_getCustomLevelObjectsMethod;
+        private static bool s_customLevelObjectsChecked;
+        private static bool s_generatorManagementRegistered;
 
         public static IReadOnlyDictionary<Type, GameObject> RegisteredPrefabs {
             get {
@@ -58,9 +63,68 @@ namespace PlusAPIToolset {
             }
         }
 
+        public static void Init(BaseUnityPlugin plugin) {
+            TryRegisterWithGeneratorManagement(plugin);
+        }
+
+        private static void TryRegisterWithGeneratorManagement(BaseUnityPlugin plugin) {
+            if (s_generatorManagementRegistered) {
+                return;
+            }
+
+            try {
+                Type? genMgmtType = Type.GetType("MTM101BaldAPI.Registers.GeneratorManagement, MTM101BaldAPI");
+                if (genMgmtType == null) {
+                    Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                    for (int i = 0; i < assemblies.Length; i++) {
+                        if (assemblies[i].GetName().Name == "MTM101BaldAPI") {
+                            genMgmtType = assemblies[i].GetType("MTM101BaldAPI.Registers.GeneratorManagement");
+                            break;
+                        }
+                    }
+                }
+
+                if (genMgmtType != null) {
+                    MethodInfo? registerMethod = genMgmtType.GetMethod("Register");
+                    if (registerMethod != null) {
+                        Action<string, int, SceneObject> callback = (floorName, floorNumber, sceneObj) => {
+                            InjectIntoSceneObject(sceneObj, floorName, floorNumber);
+                        };
+                        registerMethod.Invoke(null, new object[] { plugin, 3, callback });
+                        s_generatorManagementRegistered = true;
+                        Debug.Log("[PlusAPIToolset] Hooked into MTM101 GeneratorManagement pipeline.");
+                    }
+                }
+            } catch {
+            }
+        }
+
         public static ITM_BSODA? GetOriginalBsoda() {
             if (s_originalBsoda != null) {
                 return s_originalBsoda;
+            }
+
+            try {
+                Type? metaStorageType = Type.GetType("MTM101BaldAPI.Registers.ItemMetaStorage, MTM101BaldAPI");
+                if (metaStorageType != null) {
+                    PropertyInfo? instProp = metaStorageType.GetProperty("Instance");
+                    object? storage = instProp?.GetValue(null);
+                    if (storage != null) {
+                        MethodInfo? findMethod = metaStorageType.GetMethod("FindByEnum", new Type[] { typeof(Items) });
+                        object? meta = findMethod?.Invoke(storage, new object[] { Items.Bsoda });
+                        if (meta != null) {
+                            PropertyInfo? valProp = meta.GetType().GetProperty("value");
+                            if (valProp?.GetValue(meta) is ItemObject bsodaItem) {
+                                s_originalItemObject = bsodaItem;
+                                if (bsodaItem.item is ITM_BSODA bsodaComp) {
+                                    s_originalBsoda = bsodaComp;
+                                    return s_originalBsoda;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {
             }
 
             ItemObject[] items = Resources.FindObjectsOfTypeAll<ItemObject>();
@@ -85,6 +149,11 @@ namespace PlusAPIToolset {
         }
 
         public static ItemObject? GetOriginalItemObject() {
+            if (s_originalItemObject != null) {
+                return s_originalItemObject;
+            }
+
+            GetOriginalBsoda();
             if (s_originalItemObject != null) {
                 return s_originalItemObject;
             }
@@ -154,16 +223,11 @@ namespace PlusAPIToolset {
             newComp.SetSprite(newComp.Spray!);
             newComp.Sound = newComp.CustomSound;
 
-            ItemObject? itemObj = CreateItemObject(newComp);
-            if (itemObj != null) {
-                s_registeredItems[sodaType] = itemObj;
-
-                if (newComp.AddToLevelGeneration || newComp.AddToShopGeneration) {
-                    AddItemToLevelGeneration(itemObj, newComp.TargetFloors, newComp.SpawnWeight, newComp.AddToLevelGeneration, newComp.AddToShopGeneration);
-                }
-            }
+            ItemObject itemObj = CreateItemObject(newComp);
+            s_registeredItems[sodaType] = itemObj;
 
             sodaComponent = newComp;
+            Debug.Log($"[PlusAPIToolset] Successfully registered '{sodaType.Name}' as custom BSODA.");
             return prefab;
         }
 
@@ -173,17 +237,21 @@ namespace PlusAPIToolset {
             return prefab;
         }
 
-        public static ItemObject? CreateItemObject(SodaObject soda) {
+        public static ItemObject CreateItemObject(SodaObject soda) {
+            ItemObject itemObj;
             ItemObject? original = GetOriginalItemObject();
-            if (original == null) {
-                return null;
+            if (original != null) {
+                itemObj = UnityEngine.Object.Instantiate(original);
+            } else {
+                itemObj = ScriptableObject.CreateInstance<ItemObject>();
             }
 
-            ItemObject itemObj = UnityEngine.Object.Instantiate(original);
             itemObj.name = "Item_" + soda.gameObject.name;
             itemObj.item = soda;
             itemObj.itemType = soda.ItemType;
             itemObj.hideFlags = HideFlags.HideAndDontSave;
+            itemObj.addToInventory = true;
+            itemObj.overrideDisabled = false;
 
             if (soda.Soda_Small != null) {
                 itemObj.itemSpriteSmall = soda.Soda_Small;
@@ -202,7 +270,45 @@ namespace PlusAPIToolset {
             itemObj.value = soda.ItemValue;
 
             soda.AssociatedItem = itemObj;
+
+            try {
+                PlayerFileManager pfm = Singleton<PlayerFileManager>.Instance;
+                if (pfm != null && pfm.itemObjects != null && !pfm.itemObjects.Contains(itemObj)) {
+                    pfm.itemObjects.Add(itemObj);
+                }
+            } catch {
+            }
+
+            TryRegisterItemMeta(itemObj, soda);
+
+            Debug.Log($"[PlusAPIToolset] Registered ItemObject '{itemObj.name}' with ItemType '{itemObj.itemType}'.");
             return itemObj;
+        }
+
+        private static void TryRegisterItemMeta(ItemObject itemObj, SodaObject soda) {
+            try {
+                Type? metaStorageType = Type.GetType("MTM101BaldAPI.Registers.ItemMetaStorage, MTM101BaldAPI");
+                Type? itemMetaType = Type.GetType("MTM101BaldAPI.Registers.ItemMetaData, MTM101BaldAPI");
+                if (metaStorageType != null && itemMetaType != null) {
+                    PropertyInfo? instanceProp = metaStorageType.GetProperty("Instance");
+                    object? storageInstance = instanceProp?.GetValue(null);
+                    if (storageInstance != null) {
+                        PluginInfo? info = null;
+                        if (BepInEx.Bootstrap.Chainloader.PluginInfos.ContainsKey(soda.ModGuid)) {
+                            info = BepInEx.Bootstrap.Chainloader.PluginInfos[soda.ModGuid];
+                        } else if (PluginInitializer.Instance != null) {
+                            info = PluginInitializer.Instance.Info;
+                        }
+
+                        if (info != null) {
+                            object meta = Activator.CreateInstance(itemMetaType, new object[] { info, itemObj });
+                            MethodInfo? addMethod = metaStorageType.GetMethod("Add", new Type[] { itemMetaType });
+                            addMethod?.Invoke(storageInstance, new object[] { meta });
+                        }
+                    }
+                }
+            } catch {
+            }
         }
 
         public static BsodaFloor GetFloorFromLevelName(string? name) {
@@ -260,11 +366,186 @@ namespace PlusAPIToolset {
             return GetFloorFromLevelName(scene.name);
         }
 
+        public static void InjectIntoSceneObject(SceneObject sceneObject, string floorName = "", int floorNumber = -1) {
+            if (sceneObject == null) {
+                return;
+            }
+
+            ProcessPendingRegistrations();
+
+            BsodaFloor currentFloor = GetFloorFromScene(sceneObject);
+            if (!string.IsNullOrEmpty(floorName)) {
+                BsodaFloor nameFloor = GetFloorFromLevelName(floorName);
+                if (nameFloor != BsodaFloor.None) {
+                    currentFloor = nameFloor;
+                }
+            }
+
+            foreach (KeyValuePair<Type, ItemObject> pair in s_registeredItems) {
+                GameObject? prefab = GetPrefab(pair.Key);
+                if (prefab == null) {
+                    continue;
+                }
+
+                SodaObject soda = prefab.GetComponent<SodaObject>();
+                if (soda == null) {
+                    continue;
+                }
+
+                bool matchesFloor = currentFloor == BsodaFloor.None || (soda.TargetFloors & currentFloor) != 0;
+                if (!matchesFloor) {
+                    continue;
+                }
+
+                WeightedItemObject weightedItem = new WeightedItemObject {
+                    selection = pair.Value,
+                    weight = soda.SpawnWeight
+                };
+
+                if (soda.AddToLevelGeneration) {
+                    if (sceneObject.levelObject != null) {
+                        sceneObject.levelObject.potentialItems = AppendToArray(sceneObject.levelObject.potentialItems, weightedItem);
+                        sceneObject.levelObject.items = AppendToArray(sceneObject.levelObject.items, weightedItem);
+                    }
+
+                    if (sceneObject.randomizedLevelObject != null) {
+                        for (int i = 0; i < sceneObject.randomizedLevelObject.Length; i++) {
+                            LevelObject? rLevel = sceneObject.randomizedLevelObject[i].selection;
+                            if (rLevel != null) {
+                                rLevel.potentialItems = AppendToArray(rLevel.potentialItems, weightedItem);
+                                rLevel.items = AppendToArray(rLevel.items, weightedItem);
+                            }
+                        }
+                    }
+
+                    InjectIntoCustomLevelObjects(sceneObject, weightedItem);
+                }
+
+                if (soda.AddToShopGeneration && (soda.TargetFloors & BsodaFloor.PIT) != 0) {
+                    sceneObject.shopItems = AppendToArray(sceneObject.shopItems, new WeightedItemObject {
+                        selection = pair.Value,
+                        weight = soda.ShopWeight
+                    });
+                }
+
+                Debug.Log($"[PlusAPIToolset] Injected '{pair.Value.name}' (weight: {soda.SpawnWeight}) into SceneObject '{sceneObject.name}' (floor: {currentFloor}).");
+            }
+        }
+
+        public static void InjectIntoLevelParameters(LevelGenerationParameters ld, SceneObject? scene) {
+            if (ld == null) {
+                return;
+            }
+
+            ProcessPendingRegistrations();
+
+            BsodaFloor currentFloor = scene != null ? GetFloorFromScene(scene) : GetFloorFromLevelName(ld.name);
+
+            foreach (KeyValuePair<Type, ItemObject> pair in s_registeredItems) {
+                GameObject? prefab = GetPrefab(pair.Key);
+                if (prefab == null) {
+                    continue;
+                }
+
+                SodaObject soda = prefab.GetComponent<SodaObject>();
+                if (soda == null) {
+                    continue;
+                }
+
+                bool matchesFloor = currentFloor == BsodaFloor.None || (soda.TargetFloors & currentFloor) != 0;
+                if (!matchesFloor) {
+                    continue;
+                }
+
+                if (soda.AddToLevelGeneration) {
+                    WeightedItemObject weightedItem = new WeightedItemObject {
+                        selection = pair.Value,
+                        weight = soda.SpawnWeight
+                    };
+                    ld.potentialItems = AppendToArray(ld.potentialItems, weightedItem);
+                    ld.items = AppendToArray(ld.items, weightedItem);
+                }
+
+                if (soda.AddToShopGeneration && (soda.TargetFloors & BsodaFloor.PIT) != 0) {
+                    ld.shopItems = AppendToArray(ld.shopItems, new WeightedItemObject {
+                        selection = pair.Value,
+                        weight = soda.ShopWeight
+                    });
+                }
+
+                Debug.Log($"[PlusAPIToolset] Injected '{pair.Value.name}' into LevelGenerationParameters (floor: {currentFloor}).");
+            }
+        }
+
+        public static void InjectIntoShopScreen(StoreScreen store) {
+            if (store == null) {
+                return;
+            }
+
+            ProcessPendingRegistrations();
+
+            BaseGameManager bgm = Singleton<BaseGameManager>.Instance;
+            if (bgm != null && bgm.levelObject != null) {
+                foreach (KeyValuePair<Type, ItemObject> pair in s_registeredItems) {
+                    GameObject? prefab = GetPrefab(pair.Key);
+                    if (prefab == null) {
+                        continue;
+                    }
+
+                    SodaObject soda = prefab.GetComponent<SodaObject>();
+                    if (soda != null && soda.AddToShopGeneration && (soda.TargetFloors & BsodaFloor.PIT) != 0) {
+                        bgm.levelObject.shopItems = AppendToArray(bgm.levelObject.shopItems, new WeightedItemObject {
+                            selection = pair.Value,
+                            weight = soda.ShopWeight
+                        });
+                        Debug.Log($"[PlusAPIToolset] Injected '{pair.Value.name}' into active Johnny's Store.");
+                    }
+                }
+            }
+        }
+
+        private static void InjectIntoCustomLevelObjects(SceneObject sceneObject, WeightedItemObject item) {
+            if (!s_customLevelObjectsChecked) {
+                s_customLevelObjectsChecked = true;
+                try {
+                    Type? extType = Type.GetType("MTM101BaldAPI.CustomLevelObjectExtensions, MTM101BaldAPI");
+                    if (extType != null) {
+                        s_getCustomLevelObjectsMethod = extType.GetMethod("GetCustomLevelObjects", new Type[] { typeof(SceneObject) });
+                    }
+                } catch {
+                }
+            }
+
+            if (s_getCustomLevelObjectsMethod != null) {
+                try {
+                    Array? clos = s_getCustomLevelObjectsMethod.Invoke(null, new object[] { sceneObject }) as Array;
+                    if (clos != null) {
+                        for (int i = 0; i < clos.Length; i++) {
+                            object? clo = clos.GetValue(i);
+                            if (clo is LevelObject lo) {
+                                lo.potentialItems = AppendToArray(lo.potentialItems, item);
+                                lo.items = AppendToArray(lo.items, item);
+                            }
+                        }
+                    }
+                } catch {
+                }
+            }
+        }
+
         public static void AddItemToLevelGeneration(ItemObject item, BsodaFloor targetFloors = BsodaFloor.All, int weight = 50, bool addToHallways = true, bool addToShop = true) {
             WeightedItemObject weightedItem = new WeightedItemObject {
                 selection = item,
                 weight = weight
             };
+
+            SceneObject[] scenes = Resources.FindObjectsOfTypeAll<SceneObject>();
+            for (int i = 0; i < scenes.Length; i++) {
+                SceneObject scene = scenes[i];
+                if (scene != null) {
+                    InjectIntoSceneObject(scene);
+                }
+            }
 
             LevelObject[] levels = Resources.FindObjectsOfTypeAll<LevelObject>();
             for (int i = 0; i < levels.Length; i++) {
@@ -287,16 +568,6 @@ namespace PlusAPIToolset {
 
                 if (addToShop && (targetFloors & BsodaFloor.PIT) != 0 && level.shopItems != null) {
                     level.shopItems = AppendToArray(level.shopItems, weightedItem);
-                }
-            }
-
-            if (addToShop && (targetFloors & BsodaFloor.PIT) != 0) {
-                SceneObject[] scenes = Resources.FindObjectsOfTypeAll<SceneObject>();
-                for (int i = 0; i < scenes.Length; i++) {
-                    SceneObject scene = scenes[i];
-                    if (scene != null && scene.shopItems != null) {
-                        scene.shopItems = AppendToArray(scene.shopItems, weightedItem);
-                    }
                 }
             }
         }
@@ -327,20 +598,19 @@ namespace PlusAPIToolset {
         public static void ApplyGenerationToLoadedScenes() {
             ProcessPendingRegistrations();
 
-            foreach (KeyValuePair<Type, ItemObject> pair in s_registeredItems) {
-                GameObject? prefab = GetPrefab(pair.Key);
-                if (prefab == null) {
-                    continue;
-                }
-
-                SodaObject soda = prefab.GetComponent<SodaObject>();
-                if (soda != null && (soda.AddToLevelGeneration || soda.AddToShopGeneration)) {
-                    AddItemToLevelGeneration(pair.Value, soda.TargetFloors, soda.SpawnWeight, soda.AddToLevelGeneration, soda.AddToShopGeneration);
+            SceneObject[] scenes = Resources.FindObjectsOfTypeAll<SceneObject>();
+            for (int i = 0; i < scenes.Length; i++) {
+                if (scenes[i] != null) {
+                    InjectIntoSceneObject(scenes[i]);
                 }
             }
         }
 
         private static WeightedItemObject[] AppendToArray(WeightedItemObject[] original, WeightedItemObject newItem) {
+            if (original == null) {
+                return new WeightedItemObject[] { newItem };
+            }
+
             for (int i = 0; i < original.Length; i++) {
                 if (original[i] != null && original[i].selection == newItem.selection) {
                     return original;
@@ -492,9 +762,6 @@ namespace PlusAPIToolset {
 
             return null;
         }
-
-        private static MethodInfo? s_assetLoaderAudioClipFromFile;
-        private static bool s_assetLoaderChecked;
 
         public static SoundObject? TryResolveSound(Type type, string guid) {
             string cacheKey = $"{type.FullName}_Sound";

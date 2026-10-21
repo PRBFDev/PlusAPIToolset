@@ -6,6 +6,7 @@ using BepInEx;
 using PlusAPIToolset.BsodaToolkit;
 using PlusAPIToolset.Core;
 using UnityEngine;
+using UnityEngine.Networking;
 
 namespace PlusAPIToolset {
     public static class SodaBuilder {
@@ -143,6 +144,11 @@ namespace PlusAPIToolset {
                 UnityEngine.Object.DestroyImmediate(prefab);
                 sodaComponent = null;
                 return null;
+            }
+
+            Entity? entityComp = prefab.GetComponent<Entity>();
+            if (entityComp != null) {
+                entityComp.enabled = false;
             }
 
             newComp.SetSprite(newComp.Spray!);
@@ -487,6 +493,9 @@ namespace PlusAPIToolset {
             return null;
         }
 
+        private static MethodInfo? s_assetLoaderAudioClipFromFile;
+        private static bool s_assetLoaderChecked;
+
         public static SoundObject? TryResolveSound(Type type, string guid) {
             string cacheKey = $"{type.FullName}_Sound";
             if (s_soundCache.TryGetValue(cacheKey, out SoundObject cached)) {
@@ -496,13 +505,17 @@ namespace PlusAPIToolset {
             string soundsDir = GetSoundsPath(guid);
             string[] candidateFiles = new string[] {
                 $"{type.Name}.wav",
-                $"{type.Name}_Sound.wav"
+                $"{type.Name}.ogg",
+                $"{type.Name}.mp3",
+                $"{type.Name}_Sound.wav",
+                $"{type.Name}_Sound.ogg",
+                $"{type.Name}_Sound.mp3"
             };
 
             for (int i = 0; i < candidateFiles.Length; i++) {
                 string soundPath = Path.Combine(soundsDir, candidateFiles[i]);
                 if (File.Exists(soundPath)) {
-                    AudioClip? clip = LoadWav(soundPath);
+                    AudioClip? clip = LoadAudio(soundPath);
                     if (clip != null) {
                         SoundObject soundObj = CreateSoundObject(clip, type.Name, SoundType.Effect);
                         s_soundCache[cacheKey] = soundObj;
@@ -525,52 +538,176 @@ namespace PlusAPIToolset {
             return sound;
         }
 
-        public static AudioClip? LoadWav(string filePath) {
+        public static AudioClip? LoadAudio(string filePath) {
             if (!File.Exists(filePath)) {
                 return null;
             }
 
-            byte[] fileBytes = File.ReadAllBytes(filePath);
-            if (fileBytes.Length < 44) {
+            if (!s_assetLoaderChecked) {
+                s_assetLoaderChecked = true;
+                Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                for (int i = 0; i < assemblies.Length; i++) {
+                    if (assemblies[i].GetName().Name == "MTM101BaldAPI") {
+                        Type? assetLoaderType = assemblies[i].GetType("MTM101BaldAPI.AssetTools.AssetLoader");
+                        if (assetLoaderType != null) {
+                            s_assetLoaderAudioClipFromFile = assetLoaderType.GetMethod("AudioClipFromFile", new Type[] { typeof(string) });
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (s_assetLoaderAudioClipFromFile != null) {
+                try {
+                    AudioClip? clip = s_assetLoaderAudioClipFromFile.Invoke(null, new object[] { filePath }) as AudioClip;
+                    if (clip != null && clip.loadState != AudioDataLoadState.Failed && clip.samples > 0 && clip.length > 0f) {
+                        return clip;
+                    }
+                } catch {
+                }
+            }
+
+            try {
+                string fullPath = Path.GetFullPath(filePath);
+                string[] fallbacks = new string[] { "file:///", "file://", "", "File:///", "File://" };
+                AudioType audioType = AudioType.UNKNOWN;
+                string ext = Path.GetExtension(filePath).ToLowerInvariant();
+                if (ext == ".wav") {
+                    audioType = AudioType.WAV;
+                } else if (ext == ".ogg") {
+                    audioType = AudioType.OGGVORBIS;
+                } else if (ext == ".mp3") {
+                    audioType = AudioType.MPEG;
+                } else if (ext == ".aif" || ext == ".aiff") {
+                    audioType = AudioType.AIFF;
+                }
+
+                for (int i = 0; i < fallbacks.Length; i++) {
+                    using (UnityWebRequest req = UnityWebRequestMultimedia.GetAudioClip(fallbacks[i] + fullPath, audioType)) {
+                        req.SendWebRequest();
+                        while (!req.isDone) {
+                        }
+                        if (req.result == UnityWebRequest.Result.Success) {
+                            AudioClip clip = DownloadHandlerAudioClip.GetContent(req);
+                            if (clip != null) {
+                                if (clip.loadState == AudioDataLoadState.Failed || clip.samples <= 0 || clip.length <= 0f) {
+                                    UnityEngine.Object.DestroyImmediate(clip);
+                                    continue;
+                                }
+                                clip.name = Path.GetFileNameWithoutExtension(filePath);
+                                return clip;
+                            }
+                        }
+                    }
+                }
+            } catch {
+            }
+
+            return LoadPcmWav(filePath);
+        }
+
+        public static AudioClip? LoadWav(string filePath) {
+            return LoadAudio(filePath);
+        }
+
+        public static AudioClip? LoadPcmWav(string filePath) {
+            if (!File.Exists(filePath)) {
                 return null;
             }
 
-            int channels = BitConverter.ToInt16(fileBytes, 22);
-            int sampleRate = BitConverter.ToInt32(fileBytes, 24);
-            int bitsPerSample = BitConverter.ToInt16(fileBytes, 34);
+            try {
+                byte[] fileBytes = File.ReadAllBytes(filePath);
+                if (fileBytes.Length < 44) {
+                    return null;
+                }
 
-            int pos = 12;
-            while (pos < fileBytes.Length - 8) {
-                string chunkId = System.Text.Encoding.ASCII.GetString(fileBytes, pos, 4);
-                int chunkSize = BitConverter.ToInt32(fileBytes, pos + 4);
-                pos += 8;
+                string riff = System.Text.Encoding.ASCII.GetString(fileBytes, 0, 4);
+                string wave = System.Text.Encoding.ASCII.GetString(fileBytes, 8, 4);
+                if (riff != "RIFF" || wave != "WAVE") {
+                    return null;
+                }
 
-                if (chunkId == "data") {
-                    int bytesPerSample = bitsPerSample / 8;
-                    int totalSamples = chunkSize / bytesPerSample;
-                    float[] audioData = new float[totalSamples];
+                int pos = 12;
+                int channels = 0;
+                int sampleRate = 0;
+                int bitsPerSample = 0;
+                int audioFormat = 0;
+                int dataPos = -1;
+                int dataSize = 0;
 
-                    if (bitsPerSample == 16) {
-                        for (int i = 0; i < totalSamples; i++) {
-                            short sample = BitConverter.ToInt16(fileBytes, pos + i * 2);
+                while (pos + 8 <= fileBytes.Length) {
+                    string chunkId = System.Text.Encoding.ASCII.GetString(fileBytes, pos, 4);
+                    int chunkSize = BitConverter.ToInt32(fileBytes, pos + 4);
+                    pos += 8;
+
+                    if (chunkSize < 0 || pos + chunkSize > fileBytes.Length) {
+                        break;
+                    }
+
+                    if (chunkId == "fmt " && chunkSize >= 16) {
+                        audioFormat = BitConverter.ToInt16(fileBytes, pos);
+                        channels = BitConverter.ToInt16(fileBytes, pos + 2);
+                        sampleRate = BitConverter.ToInt32(fileBytes, pos + 4);
+                        bitsPerSample = BitConverter.ToInt16(fileBytes, pos + 14);
+                    } else if (chunkId == "data") {
+                        dataPos = pos;
+                        dataSize = chunkSize;
+                        break;
+                    }
+
+                    pos += chunkSize;
+                }
+
+                if (channels <= 0 || sampleRate <= 0 || bitsPerSample <= 0 || dataPos < 0 || dataSize <= 0) {
+                    return null;
+                }
+
+                if (audioFormat != 1) {
+                    return null;
+                }
+
+                int bytesPerSample = bitsPerSample / 8;
+                if (bytesPerSample <= 0) {
+                    return null;
+                }
+
+                int totalSamples = dataSize / bytesPerSample;
+                if (totalSamples <= 0 || totalSamples < channels) {
+                    return null;
+                }
+
+                float[] audioData = new float[totalSamples];
+                if (bitsPerSample == 16) {
+                    for (int i = 0; i < totalSamples; i++) {
+                        int sampleIndex = dataPos + i * 2;
+                        if (sampleIndex + 1 < fileBytes.Length) {
+                            short sample = BitConverter.ToInt16(fileBytes, sampleIndex);
                             audioData[i] = sample / 32768f;
                         }
-                    } else if (bitsPerSample == 8) {
-                        for (int i = 0; i < totalSamples; i++) {
-                            byte sample = fileBytes[pos + i];
+                    }
+                } else if (bitsPerSample == 8) {
+                    for (int i = 0; i < totalSamples; i++) {
+                        int sampleIndex = dataPos + i;
+                        if (sampleIndex < fileBytes.Length) {
+                            byte sample = fileBytes[sampleIndex];
                             audioData[i] = (sample - 128) / 128f;
                         }
                     }
-
-                    AudioClip clip = AudioClip.Create(Path.GetFileNameWithoutExtension(filePath), totalSamples / channels, channels, sampleRate, false);
-                    clip.SetData(audioData, 0);
-                    return clip;
+                } else {
+                    return null;
                 }
 
-                pos += chunkSize;
-            }
+                int sampleCountPerChannel = totalSamples / channels;
+                if (sampleCountPerChannel <= 0) {
+                    return null;
+                }
 
-            return null;
+                AudioClip clip = AudioClip.Create(Path.GetFileNameWithoutExtension(filePath), sampleCountPerChannel, channels, sampleRate, false);
+                clip.SetData(audioData, 0);
+                return clip;
+            } catch {
+                return null;
+            }
         }
 
         public static Sprite CreateSprite(Texture2D texture, float pixelsPerUnit = 1f) {
